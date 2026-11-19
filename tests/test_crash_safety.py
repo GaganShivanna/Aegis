@@ -82,6 +82,7 @@ def test_crash_after_launch_but_before_recording_adopts_the_live_run(
             repo.acquire_lease(spec.job_id, "ctl-a", 60),
             attempt=1,
             resume_step=40,
+            placement=["node-0", "node-1"],
         )
     assert backend.active_count == 1, "the run really did start"
     assert repo.get_action(spec.job_id, 1, ActionKind.LAUNCH).state == ActionState.FAILED

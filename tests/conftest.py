@@ -1,12 +1,27 @@
 from __future__ import annotations
 
+import shutil
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 import torch
 
-from aegis.checkpoint import CheckpointWriter, LocalCheckpointStore, model_signature
-from aegis.checkpoint.manifest import CheckpointMetadata
+from aegis.checkpoint import (
+    FORMAT_VERSION,
+    MANIFEST_NAME,
+    CheckpointManifest,
+    CheckpointMetadata,
+    Layout,
+    Location,
+    RankState,
+    ShardEntry,
+    Tier,
+    model_signature,
+    peer_of,
+)
+from aegis.checkpoint.manifest import shard_name
+from aegis.checkpoint.state import global_digests, rank_digests
 from aegis.clock import ManualClock
 from aegis.models import JobSpec, RecoveryPolicy
 from aegis.store.repository import Repository
@@ -54,8 +69,8 @@ def spec(tmp_path: Path, policy: RecoveryPolicy) -> JobSpec:
 
 
 @pytest.fixture
-def store(spec: JobSpec) -> LocalCheckpointStore:
-    return LocalCheckpointStore(spec.checkpoint_dir)
+def layout(spec: JobSpec) -> Layout:
+    return Layout(spec.checkpoint_dir)
 
 
 @pytest.fixture
@@ -64,13 +79,16 @@ def backend(spec: JobSpec) -> FakeBackend:
 
 
 class CheckpointFactory:
-    """Writes checkpoints shaped exactly like the training script's."""
+    """Writes tiered checkpoints laid out exactly as the training job does:
+    each rank's primary on its own node, a ring replica on the next node,
+    and optionally a committed copy in durable storage."""
 
-    def __init__(self, store: LocalCheckpointStore, world_size: int, job_name: str) -> None:
-        self.store = store
+    def __init__(self, layout: Layout, world_size: int, job_name: str) -> None:
+        self.layout = layout
         self.world_size = world_size
         self.job_name = job_name
         self.model = torch.nn.Linear(4, 2)
+        self.placement = [f"node-{r}" for r in range(world_size)]
 
     def metadata(self) -> CheckpointMetadata:
         return CheckpointMetadata(
@@ -81,36 +99,81 @@ class CheckpointFactory:
             torch_version=torch.__version__,
         )
 
-    def _writer(self, rank: int, step: int) -> CheckpointWriter:
-        return CheckpointWriter(
-            self.store,
-            rank=rank,
-            world_size=self.world_size,
-            job_name=self.job_name,
-            run_id=f"run-{step}",
-        )
-
-    def _payload(self, step: int) -> dict:
+    def payload(self, step: int, rank: int) -> dict:
         return {
             "step": step,
             "samples_consumed": step * 32,
             "rng_state": torch.get_rng_state(),
             "model": self.model.state_dict(),
             "optimizer": {"state": {}, "param_groups": [{"lr": 0.001}]},
+            "scheduler": {},
+            "rank": rank,
         }
 
     def write(
-        self, step: int, *, skip_manifest: bool = False, drop_rank: int | None = None
-    ) -> None:
-        """Drive the collective save serially, in the order the barriers impose."""
-        self._writer(0, step).begin(step)
+        self,
+        step: int,
+        *,
+        peer: bool = True,
+        durable: bool = False,
+        skip_manifest: bool = False,
+        drop_rank: int | None = None,
+        placement: list[str] | None = None,
+    ) -> CheckpointManifest:
+        placement = placement or self.placement
+        shards, states = [], []
         for rank in range(self.world_size):
-            if rank != drop_rank:
-                self._writer(rank, step).write_shard(step, self._payload(step))
+            directory = self.layout.dir_for(Location(Tier.LOCAL, placement[rank]), step)
+            directory.mkdir(parents=True, exist_ok=True)
+            path = directory / shard_name(rank)
+            torch.save(self.payload(step, rank), path)
+            shards.append(ShardEntry.from_file(rank, path, placement[rank]))
+            r = rank_digests(rng_state=torch.get_rng_state(), samples_consumed=step * 32)
+            states.append(RankState(rank, r["rng"], r["data_position"], step * 32))
+        manifest = CheckpointManifest(
+            format_version=FORMAT_VERSION,
+            step=step,
+            created_at=datetime.now(UTC).isoformat(),
+            shards=shards,
+            metadata=self.metadata(),
+            state_digests=global_digests(
+                model_state=self.model.state_dict(),
+                optimizer_state={"state": {}, "param_groups": [{"lr": 0.001}]},
+                scheduler_state={},
+                step=step,
+            ),
+            rank_state=states,
+        )
+        for rank in range(self.world_size):
+            local = self.layout.dir_for(Location(Tier.LOCAL, placement[rank]), step)
+            if drop_rank == rank:
+                (local / shard_name(rank)).unlink()
+            if not skip_manifest:
+                (local / MANIFEST_NAME).write_text(manifest.to_json())
+            if peer and drop_rank != rank and (node := peer_of(rank, placement)):
+                self._copy(rank, step, local, Location(Tier.PEER, node), manifest, skip_manifest)
+            if durable and drop_rank != rank:
+                self._copy(rank, step, local, Location(Tier.DURABLE), manifest, skip_manifest)
+        return manifest
+
+    def _copy(self, rank, step, source_dir, location, manifest, skip_manifest) -> None:
+        target = self.layout.dir_for(location, step)
+        target.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_dir / shard_name(rank), target / shard_name(rank))
         if not skip_manifest:
-            self._writer(0, step).publish(step, self.metadata())
+            (target / MANIFEST_NAME).write_text(manifest.to_json())
+
+    def corrupt(self, step: int, rank: int, location: Location) -> Path:
+        path = self.layout.dir_for(location, step) / shard_name(rank)
+        data = bytearray(path.read_bytes())
+        data[len(data) // 2] ^= 0xFF
+        path.write_bytes(bytes(data))
+        return path
+
+    def remove(self, step: int, rank: int, location: Location) -> None:
+        (self.layout.dir_for(location, step) / shard_name(rank)).unlink()
 
 
 @pytest.fixture
-def checkpoints(store: LocalCheckpointStore, spec: JobSpec) -> CheckpointFactory:
-    return CheckpointFactory(store, spec.world_size, spec.name)
+def checkpoints(layout: Layout, spec: JobSpec) -> CheckpointFactory:
+    return CheckpointFactory(layout, spec.world_size, spec.name)

@@ -22,6 +22,12 @@ class Settings(BaseSettings):
     tick_interval_seconds: float = 2.0
     metrics_port: int = 0  # 0 disables the exporter
 
+    # Nodes jobs may be placed on. Locally these are simulated: each has its
+    # own checkpoint directories, which disappear when the node is lost.
+    nodes: str = "node-0,node-1,node-2,node-3"
+    # Storage performance model; see aegis.checkpoint.tiers.
+    storage_profile: str = "scaled"
+
     # Kubernetes
     namespace: str = "default"
     kubeconfig: str = ""
@@ -34,11 +40,15 @@ class Settings(BaseSettings):
         return f"sqlite:///{(self.workdir / 'aegis.sqlite').resolve()}"
 
     @property
+    def node_pool(self) -> tuple[str, ...]:
+        return tuple(n.strip() for n in self.nodes.split(",") if n.strip())
+
+    @property
     def events_path(self) -> Path:
         return self.workdir / "events.jsonl"
 
-    def checkpoint_dir(self, job_name: str) -> Path:
-        return self.workdir / "checkpoints" / job_name
+    def checkpoint_dir(self, job_id: str) -> Path:
+        return self.workdir / "checkpoints" / job_id
 
     def ensure_dirs(self) -> None:
         self.workdir.mkdir(parents=True, exist_ok=True)

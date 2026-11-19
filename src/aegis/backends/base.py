@@ -24,6 +24,10 @@ class LaunchRequest:
     # placement exclusion it supports.
     excluded_nodes: tuple[str, ...] = ()
     extra_env: dict[str, str] = field(default_factory=dict)
+    # Node for each rank, chosen by the planner; rank r runs on placement[r].
+    placement: tuple[str, ...] = ()
+    # Serialized RestorePlan: which replica each rank stages from.
+    restore_plan: str | None = None
 
 
 class ExecutionBackend(ABC):
@@ -51,3 +55,7 @@ class ExecutionBackend(ABC):
     def progress_path(self, spec: JobSpec) -> str:
         """Where the training script publishes its progress heartbeat."""
         raise NotImplementedError
+
+    def restore_report_path(self, spec: JobSpec, attempt: int) -> str | None:
+        """Where an attempt's restore report lands, if the backend can see it."""
+        return None

@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from aegis.backends.base import ExecutionBackend, LaunchRequest
+from aegis.checkpoint.restore import REPORT_NAME, RankRestoreReport, RestoreReport
 from aegis.controller.progress import write_progress
 from aegis.models import JobSpec, RunHandle, RunPhase, RunStatus
 
@@ -46,7 +47,11 @@ class FakeBackend(ExecutionBackend):
             reference=f"fake-{request.attempt}-{request.run_id}",
             started_at=datetime.now(UTC),
             run_dir=str(Path(request.spec.workdir) / f"attempt-{request.attempt}"),
-            extra={"run_id": request.run_id},
+            extra={
+                "run_id": request.run_id,
+                "placement": list(request.placement),
+                "resume_step": request.resume_step,
+            },
         )
         self.runs[handle.action_id] = handle
         self.phases[handle.action_id] = RunStatus(RunPhase.RUNNING)
@@ -75,7 +80,33 @@ class FakeBackend(ExecutionBackend):
     def progress_path(self, spec: JobSpec) -> str:
         return self._progress_file
 
+    def restore_report_path(self, spec: JobSpec, attempt: int) -> str | None:
+        return str(Path(spec.workdir) / f"attempt-{attempt}" / REPORT_NAME)
+
     # -- test controls
+
+    def write_restore_report(
+        self, *, outcome: str = "restored", failed_check: str | None = None, error: str = ""
+    ) -> RestoreReport:
+        """What the training job writes after staging and verifying a restore."""
+        request = self.launch_log[-1]
+        checks = {"global.model": True, "rank.rng": True, "rank.data_position": True, "step": True}
+        if failed_check:
+            checks[failed_check] = False
+        report = RestoreReport(
+            run_id=request.run_id,
+            attempt=request.attempt,
+            step=request.resume_step,
+            ranks=[
+                RankRestoreReport(rank=r, node=n, checks=dict(checks), error=error)
+                for r, n in enumerate(request.placement)
+            ],
+            outcome=outcome,
+        )
+        path = Path(self.restore_report_path(request.spec, request.attempt))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        report.write(path)
+        return report
 
     @property
     def current(self) -> RunHandle:
@@ -103,12 +134,15 @@ class FakeBackend(ExecutionBackend):
         self.phases[handle.action_id] = RunStatus(RunPhase.SUCCEEDED, 0)
         self.runs.pop(handle.action_id, None)
 
-    def report_progress(self, step: int, *, run_id: str | None = None, attempt: int = 0) -> None:
+    def report_progress(
+        self, step: int, *, run_id: str | None = None, attempt: int = 0, step_seconds: float | None = None
+    ) -> None:
         write_progress(
             self._progress_file,
             step=step,
             run_id=run_id if run_id is not None else self.current.extra["run_id"],
             attempt=attempt,
+            step_seconds=step_seconds,
         )
 
     def orphan_current(self) -> RunHandle:

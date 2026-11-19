@@ -109,6 +109,11 @@ class KubernetesBackend(ExecutionBackend):
             "AEGIS_WORLD_SIZE": str(spec.world_size),
             "AEGIS_TOTAL_STEPS": str(spec.total_steps),
             "AEGIS_RESUME_STEP": "" if request.resume_step is None else str(request.resume_step),
+            # Node names are passed through so ranks stage and checkpoint
+            # under the right identity. Pinning each rank's pod to its node
+            # needs per-rank pods (an indexed Job or JobSet) and is not done.
+            "AEGIS_PLACEMENT": ",".join(request.placement),
+            "AEGIS_RESTORE_PLAN_JSON": request.restore_plan or "",
             "TORCHELASTIC_MAX_RESTARTS": "0",
         }
         labels = {

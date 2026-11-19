@@ -38,6 +38,7 @@ from aegis.store.db import (
     IncidentRow,
     JobRow,
     LeaseRow,
+    NodeRow,
     SignalRow,
     create_engine_for,
     create_session_factory,
@@ -354,13 +355,65 @@ class Repository:
             return row
 
     def append_incident_action(self, incident_id: int, entry: dict[str, Any]) -> None:
+        self.append_incident(incident_id, "actions", entry)
+
+    def append_incident(self, incident_id: int, field: str, entry: dict[str, Any]) -> None:
+        """Append to one of the incident's JSON list columns."""
         with self.session() as s:
             row = s.get(IncidentRow, incident_id)
             if row is None:
                 return
             # Reassign: JSON columns are not change-tracked in place.
-            row.actions = [*(row.actions or []), {**entry, "at": self.clock.now().isoformat()}]
+            setattr(row, field, [*(getattr(row, field) or []), {**entry, "at": self.clock.now().isoformat()}])
             s.add(row)
+
+    def mark_timeline(self, job_id: str, phase: str, **detail: Any) -> bool:
+        """Record a phase transition on the job's open incident, once.
+
+        Ticks are retried after crashes, so the same phase for the same
+        attempt can be reported more than once; only the first is kept.
+        Returns True if the entry was added.
+        """
+        incident_id = self.open_incident_id(job_id)
+        if incident_id is None:
+            return False
+        with self.session() as s:
+            row = s.get(IncidentRow, incident_id)
+            if row is None:
+                return False
+            timeline = list(row.timeline or [])
+            key = (phase, detail.get("attempt"))
+            if any((e.get("phase"), e.get("attempt")) == key for e in timeline):
+                return False
+            timeline.append({"phase": phase, "at": self.clock.now().isoformat(), **detail})
+            row.timeline = timeline
+            s.add(row)
+            return True
+
+    # ----------------------------------------------------------------- nodes
+
+    def set_node_health(self, name: str, healthy: bool, reason: str = "") -> bool:
+        """Returns True if this changed the node's recorded health."""
+        with self.session() as s:
+            row = s.get(NodeRow, name)
+            if row is None:
+                s.add(NodeRow(name=name, healthy=int(healthy), reason=reason, changed_at=self.clock.now()))
+                return not healthy
+            if bool(row.healthy) == healthy:
+                return False
+            row.healthy = int(healthy)
+            row.reason = reason
+            row.changed_at = self.clock.now()
+            s.add(row)
+            return True
+
+    def unhealthy_nodes(self) -> set[str]:
+        with self.session() as s:
+            return {r.name for r in s.scalars(select(NodeRow).where(NodeRow.healthy == 0))}
+
+    def list_nodes(self) -> list[NodeRow]:
+        with self.session() as s:
+            return list(s.scalars(select(NodeRow).order_by(NodeRow.name)))
 
     def close_incident(
         self,

@@ -32,6 +32,7 @@ def write_progress(
     attempt: int,
     loss: float | None = None,
     finished: bool = False,
+    step_seconds: float | None = None,
 ) -> None:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -40,6 +41,7 @@ def write_progress(
         "run_id": run_id,
         "attempt": attempt,
         "loss": loss,
+        "step_seconds": step_seconds,
         "finished": finished,
         "updated_at": datetime.now(UTC).isoformat(),
     }
@@ -77,6 +79,8 @@ class ProgressWatcher:
             run_id=run_id,
             attempt=int(payload.get("attempt", 0)),
             loss=payload.get("loss"),
+            step_seconds=payload.get("step_seconds"),
+            finished=bool(payload.get("finished")),
         )
 
     def is_finished(self) -> bool:

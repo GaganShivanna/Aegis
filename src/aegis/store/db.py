@@ -24,6 +24,8 @@ from sqlalchemy import (
     UniqueConstraint,
     create_engine,
     event,
+    inspect,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
@@ -80,10 +82,36 @@ class JobRow(Base):
     next_attempt_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
     suspect_since: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
 
+    # Where each rank runs; rank r is on placement[r].
+    placement: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    # Checkpoints whose restore failed state verification; never chosen again.
+    bad_steps: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    # Measured seconds per training step, used to price replayed computation.
+    step_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Newest health event already consumed, so a restarted controller does not
+    # re-apply events it acted on before it crashed.
+    events_watermark: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(UtcDateTime, default=lambda: datetime.now(UTC))
     updated_at: Mapped[datetime] = mapped_column(UtcDateTime, default=lambda: datetime.now(UTC))
     finished_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
     message: Mapped[str] = mapped_column(Text, default="")
+
+
+class NodeRow(Base):
+    """Persistent node health.
+
+    Level-triggered: a node reported unhealthy stays out of placement until
+    something reports it healthy again, across controller restarts, rather
+    than being forgotten when the in-memory signal is gone.
+    """
+
+    __tablename__ = "nodes"
+
+    name: Mapped[str] = mapped_column(String(128), primary_key=True)
+    healthy: Mapped[bool] = mapped_column(Integer, default=1)
+    reason: Mapped[str] = mapped_column(Text, default="")
+    changed_at: Mapped[datetime] = mapped_column(UtcDateTime, default=lambda: datetime.now(UTC))
 
 
 class LeaseRow(Base):
@@ -151,6 +179,14 @@ class IncidentRow(Base):
     outcome: Mapped[str] = mapped_column(String(32), index=True, default="in_progress")
     detail: Mapped[str] = mapped_column(Text, default="")
 
+    # Every plan made during this incident (one per attempt), with the
+    # alternatives it rejected and their estimated costs.
+    plans: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    restore_reports: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    # Ordered (time, phase, detail) entries: detected, planned, launched,
+    # restored, verified ...
+    timeline: Mapped[list | None] = mapped_column(JSON, nullable=True)
+
 
 class SignalRow(Base):
     """Raw health events, deduplicated per incident."""
@@ -179,7 +215,24 @@ def create_engine_for(url: str, *, echo: bool = False) -> Engine:
     if url.startswith("sqlite"):
         _enable_sqlite_wal(engine)
     Base.metadata.create_all(engine)
+    _add_missing_columns(engine)
     return engine
+
+
+def _add_missing_columns(engine: Engine) -> None:
+    """Additive migration: create nullable columns added since the database
+    was created. `create_all` only creates missing tables."""
+    inspector = inspect(engine)
+    with engine.begin() as conn:
+        for table in Base.metadata.sorted_tables:
+            if not inspector.has_table(table.name):
+                continue
+            existing = {c["name"] for c in inspector.get_columns(table.name)}
+            for column in table.columns:
+                if column.name in existing or not column.nullable:
+                    continue
+                kind = column.type.compile(dialect=engine.dialect)
+                conn.execute(text(f'ALTER TABLE {table.name} ADD COLUMN "{column.name}" {kind}'))
 
 
 def create_session_factory(engine: Engine) -> sessionmaker:

@@ -7,22 +7,24 @@ from datetime import UTC, datetime
 
 import pytest
 
-from aegis.checkpoint import LocalCheckpointStore
-from aegis.checkpoint.store import FaultInjectingStore
+from aegis.checkpoint import CheckpointCatalog
+from aegis.checkpoint.tiers import UNTHROTTLED
 from aegis.controller.reconciler import Reconciler, ReconcilerConfig
 from aegis.events.base import InMemoryEventSource
 from aegis.models import HealthEvent, JobState, Outcome, SignalKind
 
+POOL = ("node-0", "node-1", "node-2", "node-3")
 
-def make_reconciler(repo, backend, clock, *, events=None, store_factory=None, holder="ctl-a"):
+
+def make_reconciler(repo, backend, clock, *, events=None, holder="ctl-a", pool=POOL):
     return Reconciler(
         repo,
         backend,
-        store_factory or (lambda spec: LocalCheckpointStore(spec.checkpoint_dir)),
         event_source=events,
-        config=ReconcilerConfig(holder_id=holder, startup_grace_seconds=30.0),
+        config=ReconcilerConfig(holder_id=holder, startup_grace_seconds=30.0, node_pool=pool),
         clock=clock,
         rng=random.Random(0),
+        profiles=UNTHROTTLED,
     )
 
 
@@ -138,7 +140,7 @@ def test_all_checkpoints_invalid_escalates_instead_of_restarting_from_scratch(
     repo, spec, backend, clock, checkpoints, policy
 ):
     checkpoints.write(40, skip_manifest=True)
-    checkpoints.write(50, drop_rank=1)
+    checkpoints.write(50, peer=False, drop_rank=1)
     repo.register_job(spec)
     r = make_reconciler(repo, backend, clock)
 
@@ -147,18 +149,26 @@ def test_all_checkpoints_invalid_escalates_instead_of_restarting_from_scratch(
     r.tick(spec.job_id)
 
     assert state(repo, spec) is JobState.EXHAUSTED
-    assert "no valid checkpoint" in repo.get_job(spec.job_id).message
+    assert "no recoverable checkpoint" in repo.get_job(spec.job_id).message
     assert backend.active_count == 0
 
 
 def test_storage_failure_retries_without_consuming_an_attempt(
-    repo, spec, backend, clock, checkpoints, policy
+    repo, spec, backend, clock, checkpoints, policy, monkeypatch
 ):
     checkpoints.write(40)
     repo.register_job(spec)
+    r = make_reconciler(repo, backend, clock)
 
-    flaky = FaultInjectingStore(LocalCheckpointStore(spec.checkpoint_dir), fail_times=1)
-    r = make_reconciler(repo, backend, clock, store_factory=lambda _spec: flaky)
+    real_survey = CheckpointCatalog.survey
+    failures = iter([OSError("object store timed out")])
+
+    def flaky_survey(self, **kwargs):
+        if (exc := next(failures, None)) is not None:
+            raise exc
+        return real_survey(self, **kwargs)
+
+    monkeypatch.setattr(CheckpointCatalog, "survey", flaky_survey)
 
     drive_to_recovery(repo, spec, backend, clock, r, policy)
     clock.advance(policy.backoff_for(1) + 1)

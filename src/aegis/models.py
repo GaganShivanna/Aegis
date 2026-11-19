@@ -29,6 +29,7 @@ TERMINAL_STATES = frozenset({JobState.SUCCEEDED, JobState.EXHAUSTED, JobState.ST
 class SignalKind(StrEnum):
     NODE_UNHEALTHY = "node_unhealthy"  # from NVSentinel node conditions
     NODE_DRAINING = "node_draining"
+    NODE_HEALTHY = "node_healthy"  # node repaired; eligible for placement again
     WORKER_EXIT = "worker_exit"  # non-zero worker termination
     PROGRESS_STALLED = "progress_stalled"  # no new steps within timeout
     CHECKPOINT_INVALID = "checkpoint_invalid"
@@ -104,6 +105,10 @@ class RecoveryPolicy:
     max_checkpoint_candidates: int = 10
     keep_checkpoints: int = 5
 
+    # How to choose among recoverable checkpoints: "cost" (estimated time
+    # back to the failure point), "newest", or "durable-only".
+    planner: str = "cost"
+
     @property
     def policy_id(self) -> str:
         return f"{self.name}@v{self.version}"
@@ -178,6 +183,8 @@ class ProgressSample:
     run_id: str = ""
     attempt: int = 0
     loss: float | None = None
+    step_seconds: float | None = None
+    finished: bool = False
 
 
 def deterministic_action_id(job_id: str, attempt: int, kind: ActionKind) -> str:

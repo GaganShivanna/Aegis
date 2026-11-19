@@ -12,4 +12,5 @@ checkpoints/
 *.sqlite-journal
 *.log
 .aegis*/
-runs/
+experiments*/*/trials/
+experiments-smoke/

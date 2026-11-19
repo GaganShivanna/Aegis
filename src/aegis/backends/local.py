@@ -20,6 +20,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from aegis.backends.base import ExecutionBackend, LaunchRequest
+from aegis.checkpoint.restore import PLAN_NAME, REPORT_NAME
 from aegis.models import JobSpec, RunHandle, RunPhase, RunStatus
 
 log = logging.getLogger(__name__)
@@ -27,6 +28,8 @@ log = logging.getLogger(__name__)
 RUN_META = "run.json"
 EXIT_CODE_FILE = "exit_code"
 PROGRESS_FILE = "progress.json"
+METRICS_FILE = "metrics.jsonl"
+TRAINING_SCRIPT = Path(__file__).resolve().parents[3] / "training" / "train_ddp.py"
 
 
 class LocalBackend(ExecutionBackend):
@@ -53,6 +56,12 @@ class LocalBackend(ExecutionBackend):
         # heartbeats left behind by a previous attempt.
         return str(self.job_dir(spec) / PROGRESS_FILE)
 
+    def metrics_path(self, spec: JobSpec) -> str:
+        return str(self.job_dir(spec) / METRICS_FILE)
+
+    def restore_report_path(self, spec: JobSpec, attempt: int) -> str | None:
+        return str(self.run_dir(spec, attempt) / REPORT_NAME)
+
     # ------------------------------------------------------------- launch
 
     def launch(self, request: LaunchRequest) -> RunHandle:
@@ -60,11 +69,18 @@ class LocalBackend(ExecutionBackend):
         run_dir = self.run_dir(spec, request.attempt)
         run_dir.mkdir(parents=True, exist_ok=True)
         (run_dir / EXIT_CODE_FILE).unlink(missing_ok=True)
+        (run_dir / REPORT_NAME).unlink(missing_ok=True)
+        plan_path = run_dir / PLAN_NAME
+        if request.restore_plan:
+            _write_json_text(plan_path, request.restore_plan)
+        else:
+            plan_path.unlink(missing_ok=True)
 
         env = {
             **os.environ,
             **spec.env,
             **request.extra_env,
+            "AEGIS_METRICS_FILE": self.metrics_path(spec),
             "AEGIS_JOB_ID": spec.job_id,
             "AEGIS_JOB_NAME": spec.name,
             "AEGIS_RUN_ID": request.run_id,
@@ -76,6 +92,9 @@ class LocalBackend(ExecutionBackend):
             "AEGIS_TOTAL_STEPS": str(spec.total_steps),
             "AEGIS_RESUME_STEP": "" if request.resume_step is None else str(request.resume_step),
             "AEGIS_EXCLUDED_NODES": ",".join(request.excluded_nodes),
+            "AEGIS_PLACEMENT": ",".join(request.placement),
+            "AEGIS_RESTORE_PLAN": str(plan_path) if request.restore_plan else "",
+            "AEGIS_RUN_DIR": str(run_dir),
             # Aegis owns job-level retries; Elastic must not run its own.
             "TORCHELASTIC_MAX_RESTARTS": "0",
             "OMP_NUM_THREADS": env_default("OMP_NUM_THREADS", "1"),
@@ -111,7 +130,13 @@ class LocalBackend(ExecutionBackend):
             reference=str(proc.pid),
             started_at=datetime.now(UTC),
             run_dir=str(run_dir),
-            extra={"pgid": proc.pid, "run_id": request.run_id, "log": str(logfile)},
+            extra={
+                "pgid": proc.pid,
+                "run_id": request.run_id,
+                "log": str(logfile),
+                "placement": list(request.placement),
+                "resume_step": request.resume_step,
+            },
         )
         self._procs[handle.action_id] = proc
         _write_json(run_dir / RUN_META, _handle_payload(handle))
@@ -139,7 +164,7 @@ class LocalBackend(ExecutionBackend):
             "--max_restarts=0",
             "--master_addr=127.0.0.1",
             f"--master_port={_free_port()}",
-            "training/train_ddp.py",
+            str(TRAINING_SCRIPT),
         ]
 
     # ------------------------------------------------------------- status
@@ -256,8 +281,12 @@ def _free_port() -> int:
 
 
 def _write_json(path: Path, payload: dict) -> None:
+    _write_json_text(path, json.dumps(payload, indent=2, default=str))
+
+
+def _write_json_text(path: Path, text: str) -> None:
     tmp = path.with_name(f".{path.name}.tmp")
-    tmp.write_text(json.dumps(payload, indent=2, default=str))
+    tmp.write_text(text)
     os.replace(tmp, path)
 
 
